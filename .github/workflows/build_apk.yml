@@ -1,0 +1,266 @@
+name: Build Wirdi Test APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+  pull_request:
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: false
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      - name: Generate Android platform folder
+        run: flutter create --platforms=android --org com.wirdi --project-name wirdi .
+
+      - name: Patch Android permissions
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("android/app/src/main/AndroidManifest.xml")
+          text = path.read_text()
+
+          permissions = """
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+          """
+
+          if "android.permission.INTERNET" not in text:
+              text = text.replace(
+                  '<manifest xmlns:android="http://schemas.android.com/apk/res/android">',
+                  '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\\n' + permissions,
+              )
+
+          queries_block = """
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.VIEW" />
+                      <data android:scheme="https" />
+                  </intent>
+                  <intent>
+                      <action android:name="android.intent.action.VIEW" />
+                      <data android:scheme="geo" />
+                  </intent>
+              </queries>
+          """
+
+          if "<queries>" not in text:
+              text = text.replace("</manifest>", queries_block + "</manifest>")
+
+          path.write_text(text)
+          PY
+
+      - name: Patch Android Gradle for core library desugaring
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # flutter_local_notifications requires Android core library
+          # desugaring to be enabled in the app module. `flutter create`
+          # emits Kotlin DSL (build.gradle.kts) on current stable, but
+          # this handles the older Groovy format too in case that ever
+          # changes upstream.
+          kts_path = Path("android/app/build.gradle.kts")
+          groovy_path = Path("android/app/build.gradle")
+          path = kts_path if kts_path.exists() else groovy_path
+          text = path.read_text()
+          is_kts = path.suffix == ".kts"
+
+          if "isCoreLibraryDesugaringEnabled" not in text and "coreLibraryDesugaringEnabled" not in text:
+              flag_line = (
+                  "        isCoreLibraryDesugaringEnabled = true\n"
+                  if is_kts
+                  else "        coreLibraryDesugaringEnabled true\n"
+              )
+              text = text.replace("compileOptions {\n", "compileOptions {\n" + flag_line, 1)
+
+          if "coreLibraryDesugaring(" not in text and "coreLibraryDesugaring " not in text:
+              dep_line = (
+                  '    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")\n'
+                  if is_kts
+                  else "    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'\n"
+              )
+              if "\ndependencies {" in text:
+                  text = text.replace("\ndependencies {", "\ndependencies {\n" + dep_line, 1)
+              else:
+                  text += "\ndependencies {\n" + dep_line + "}\n"
+
+          path.write_text(text)
+          PY
+
+      - name: Generate Next Prayer home screen widget (native Android files)
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          base = Path("android/app/src/main/kotlin/com/wirdi/wirdi")
+          base.mkdir(parents=True, exist_ok=True)
+          (base / "NextPrayerWidgetProvider.kt").write_text("""package com.wirdi.wirdi
+
+          import android.appwidget.AppWidgetManager
+          import android.content.Context
+          import android.content.SharedPreferences
+          import android.widget.RemoteViews
+          import es.antonborri.home_widget.HomeWidgetLaunchIntent
+          import es.antonborri.home_widget.HomeWidgetProvider
+
+          class NextPrayerWidgetProvider : HomeWidgetProvider() {
+              override fun onUpdate(
+                  context: Context,
+                  appWidgetManager: AppWidgetManager,
+                  appWidgetIds: IntArray,
+                  widgetData: SharedPreferences
+              ) {
+                  appWidgetIds.forEach { widgetId ->
+                      val prayerName = widgetData.getString("next_prayer_name", null) ?: "--"
+                      val prayerTime = widgetData.getString("next_prayer_time", null) ?: "--:--"
+
+                      val views = RemoteViews(context.packageName, R.layout.next_prayer_widget)
+                      views.setTextViewText(R.id.widget_prayer_name, prayerName)
+                      views.setTextViewText(R.id.widget_prayer_time, prayerTime)
+
+                      val pendingIntent = HomeWidgetLaunchIntent.getActivity(context, MainActivity::class.java)
+                      views.setOnClickPendingIntent(R.id.widget_root, pendingIntent)
+
+                      appWidgetManager.updateAppWidget(widgetId, views)
+                  }
+              }
+          }
+          """)
+
+          layout_dir = Path("android/app/src/main/res/layout")
+          layout_dir.mkdir(parents=True, exist_ok=True)
+          (layout_dir / "next_prayer_widget.xml").write_text("""<?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/widget_root"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:gravity="center_vertical"
+              android:padding="16dp"
+              android:background="@drawable/next_prayer_widget_bg">
+
+              <TextView
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:text="Wirdi"
+                  android:textColor="#B0FFFFFF"
+                  android:textSize="12sp" />
+
+              <TextView
+                  android:id="@+id/widget_prayer_name"
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="4dp"
+                  android:text="--"
+                  android:textColor="#FFFFFFFF"
+                  android:textSize="22sp"
+                  android:textStyle="bold" />
+
+              <TextView
+                  android:id="@+id/widget_prayer_time"
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="2dp"
+                  android:text="--:--"
+                  android:textColor="#FFD4AF37"
+                  android:textSize="16sp" />
+
+          </LinearLayout>
+          """)
+
+          xml_dir = Path("android/app/src/main/res/xml")
+          xml_dir.mkdir(parents=True, exist_ok=True)
+          (xml_dir / "next_prayer_widget_info.xml").write_text("""<?xml version="1.0" encoding="utf-8"?>
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:minWidth="180dp"
+              android:minHeight="90dp"
+              android:updatePeriodMillis="1800000"
+              android:initialLayout="@layout/next_prayer_widget"
+              android:resizeMode="horizontal|vertical"
+              android:widgetCategory="home_screen" />
+          """)
+
+          drawable_dir = Path("android/app/src/main/res/drawable")
+          drawable_dir.mkdir(parents=True, exist_ok=True)
+          (drawable_dir / "next_prayer_widget_bg.xml").write_text("""<?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android"
+              android:shape="rectangle">
+              <solid android:color="#FF0F766E" />
+              <corners android:radius="16dp" />
+          </shape>
+          """)
+
+          manifest_path = Path("android/app/src/main/AndroidManifest.xml")
+          manifest_text = manifest_path.read_text()
+          receiver_block = """    <receiver android:name=".NextPrayerWidgetProvider" android:exported="true">
+                  <intent-filter>
+                      <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                  </intent-filter>
+                  <meta-data
+                      android:name="android.appwidget.provider"
+                      android:resource="@xml/next_prayer_widget_info" />
+              </receiver>
+          </application>"""
+          if "NextPrayerWidgetProvider" not in manifest_text:
+              manifest_text = manifest_text.replace("</application>", receiver_block, 1)
+          manifest_path.write_text(manifest_text)
+
+          PY
+
+      - name: Clear Flutter Cache
+        run: |
+          flutter pub cache clean --force || true
+
+      - name: Remove Old Lock File
+        run: |
+          rm -f pubspec.lock
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Show Dependencies
+        run: flutter pub deps
+
+      - name: Analyze
+        run: flutter analyze || true
+
+      - name: Build debug APK
+        run: flutter build apk --debug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wirdi-debug-apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: error
